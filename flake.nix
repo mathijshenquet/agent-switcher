@@ -20,12 +20,21 @@
           pkgs = nixpkgs.legacyPackages.${system};
         in
         {
-          claude-switch = pkgs.writeShellApplication {
-            name = "claude-switch";
-            runtimeInputs = [ pkgs.jq ] ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.procps;
-            # jq filters are single-quoted on purpose
-            excludeShellChecks = [ "SC2016" ];
-            text = builtins.readFile ./claude-switch;
+          claude-switch = pkgs.stdenvNoCC.mkDerivation {
+            pname = "claude-switch";
+            version = "0.2.0";
+            src = ./.;
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+            buildInputs = [ pkgs.python3 ];
+            doCheck = true;
+            checkPhase = "${pkgs.python3}/bin/python3 -m unittest -v test_claude_switch";
+            installPhase = ''
+              install -Dm755 claude_switch.py $out/bin/claude-switch
+            '';
+            # macOS ships pgrep and security in /usr/bin
+            postFixup = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+              wrapProgram $out/bin/claude-switch --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.procps ]}
+            '';
           };
           default = self.packages.${system}.claude-switch;
         }
