@@ -6,7 +6,7 @@ Switch between Claude Code subscription logins. Sessions are keyed by account; t
 claude-switch                   # status
 claude-switch NICK              # switch to NICK (new nickname: log in fresh, saved on next run)
 claude-switch -                 # switch to the other session, or pick one
-claude-switch --rename OLD NEW
+claude-switch --rename [OLD] NEW   # default: the current session
 ```
 
 Quit all `claude` processes before switching (or pass `-f`).

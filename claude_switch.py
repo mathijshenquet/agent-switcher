@@ -349,6 +349,22 @@ class Switcher:
             self.save_session(key, {**self.sessions()[key], "nickname": new})
         self.out(f"renamed '{old}' to '{new}'")
 
+    def rename_current(self, new: str) -> None:
+        current = self.capture_live(interactive=False)
+        if current is not None:
+            return self.rename(current, new)
+        snapshot = self.live_snapshot()
+        key = account_key((snapshot or {}).get("oauthAccount"))
+        if snapshot is not None and key is not None:
+            # an unsaved login has no nickname yet: naming it saves it
+            self.check_new_nickname(new)
+            self.save_session(key, {"nickname": new, **snapshot})
+            self.out(f"saved current login as '{new}'")
+            return
+        if snapshot is None and (pending := self.pending()) is not None:
+            return self.rename(pending, new)
+        raise Error("no current session to rename")
+
     def list(self) -> None:
         self.capture_live(interactive=False)
         snapshot = self.live_snapshot()
@@ -373,7 +389,9 @@ def main(argv=None, env=None) -> int:
         nargs="?",
         help="session to switch to (new nickname: start a fresh login; '-': the other one); omit for status",
     )
-    parser.add_argument("--rename", nargs=2, metavar=("OLD", "NEW"), help="rename a session's nickname")
+    parser.add_argument(
+        "--rename", nargs="+", metavar="NAME", help="[OLD] NEW: rename a session's nickname (default: the current one)"
+    )
     parser.add_argument("-f", "--force", action="store_true", help="switch even if claude is running")
     args = parser.parse_args(argv)
 
@@ -384,7 +402,12 @@ def main(argv=None, env=None) -> int:
         paths.store.mkdir(parents=True, exist_ok=True)
         s = Switcher(paths, secure)
         if args.rename:
-            s.rename(*args.rename)
+            if len(args.rename) > 2:
+                parser.error("--rename takes [OLD] NEW")
+            if len(args.rename) == 2:
+                s.rename(*args.rename)
+            else:
+                s.rename_current(args.rename[0])
         elif args.name == "-":
             s.pick(args.force)
         elif args.name:

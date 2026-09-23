@@ -295,6 +295,43 @@ class TestSwitch(Base):
             self.switcher().rename("nope", "x")
 
 
+class TestRenameCurrent(Base):
+    def test_renames_live_session(self):
+        self.login("A", ACCT_A)
+        self.answers = ["personal"]
+        self.switcher().switch("work")
+        self.login("B", ACCT_B)
+        self.switcher().rename_current("job")
+        self.assertEqual(self.saved(ACCT_B)["nickname"], "job")
+        self.assertEqual(self.saved(ACCT_A)["nickname"], "personal")
+
+    def test_names_unsaved_login(self):
+        self.login("A", ACCT_A)
+        self.switcher().rename_current("personal")
+        self.assertEqual(self.saved(ACCT_A)["nickname"], "personal")
+        self.assertEqual(self.output[-1], "saved current login as 'personal'")
+        self.assertEqual(self.questions, [])
+
+    def test_renames_pending_when_logged_out(self):
+        self.login("A", ACCT_A)
+        self.answers = ["personal"]
+        self.switcher().switch("work")
+        self.switcher().rename_current("job")
+        self.assertEqual(self.switcher().pending(), "job")
+
+    def test_nothing_to_rename(self):
+        with self.assertRaisesRegex(cs.Error, "no current session"):
+            self.switcher().rename_current("x")
+
+    def test_taken_nickname(self):
+        self.login("A", ACCT_A)
+        self.answers = ["personal"]
+        self.switcher().switch("work")
+        self.login("B", ACCT_B)
+        with self.assertRaisesRegex(cs.Error, "already taken"):
+            self.switcher().rename_current("personal")
+
+
 class FakeSecurity:
     """Stands in for macOS `security`: find-generic-password and `-i` add-generic-password."""
 
