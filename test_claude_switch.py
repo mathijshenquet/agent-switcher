@@ -244,7 +244,31 @@ class TestSwitch(Base):
     def test_status(self):
         self.assertEqual(self.status(), ["not logged in, no saved sessions"])
         self.login("A", ACCT_A)
-        self.assertEqual(self.status(), ["* (unsaved)        alice@x (orgA)"])
+        self.assertEqual(
+            self.status(), ["* (unsaved)        alice@x (orgA)  (next switch asks for a nickname)"]
+        )
+        self.assertEqual(self.questions, [])
+        self.assertEqual(self.switcher().sessions(), {})
+
+    def test_status_applies_pending_nickname(self):
+        self.login("A", ACCT_A)
+        self.answers = ["personal"]
+        self.switcher().switch("work")
+        self.login("B", ACCT_B)
+        self.assertEqual(self.status(), ["  personal         alice@x (orgA)", "* work             bob@y (orgB)"])
+        self.assertEqual(self.saved(ACCT_B)["nickname"], "work")
+        self.assertFalse(self.paths.pending.exists())
+        self.assertEqual(len(self.questions), 1)
+
+    def test_status_refreshes_known_account(self):
+        self.login("A", ACCT_A)
+        self.answers = ["personal"]
+        self.switcher().switch("work")
+        self.login("B", ACCT_B)
+        self.switcher().switch("personal")
+        self.refresh("R-rotated")
+        self.status()
+        self.assertEqual(self.saved(ACCT_A)["credentials"]["claudeAiOauth"]["refreshToken"], "R-rotated")
 
     def test_pick_multiple_prompts(self):
         self.login("A", ACCT_A)

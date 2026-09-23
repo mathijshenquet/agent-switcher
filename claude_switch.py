@@ -238,13 +238,18 @@ class Switcher:
         if self.key_for(name) is not None:
             raise Error(f"nickname '{name}' is already taken")
 
-    def capture_live(self):
-        """Save the live login's current tokens under its account; return its nickname."""
+    def capture_live(self, interactive: bool = True):
+        """Save the live login's current tokens under its account; return its nickname.
+
+        Non-interactive, a login that would need a nickname prompt is left unsaved.
+        """
         snapshot = self.live_snapshot()
         if snapshot is None:
             return None
         key = account_key(snapshot["oauthAccount"])
         if key is None:
+            if not interactive:
+                return None
             raise Error("live login has no oauthAccount in ~/.claude.json; start claude once so it records it")
         existing = self.sessions().get(key)
         if existing:
@@ -252,6 +257,8 @@ class Switcher:
         elif (pending := self.pending()) is not None:
             nickname = pending
             self.check_new_nickname(nickname)
+        elif not interactive:
+            return None
         else:
             nickname = self.ask_nickname(
                 f"new login {account_label(snapshot)}; nickname", default_nickname(snapshot["oauthAccount"])
@@ -343,11 +350,12 @@ class Switcher:
         self.out(f"renamed '{old}' to '{new}'")
 
     def list(self) -> None:
+        self.capture_live(interactive=False)
         snapshot = self.live_snapshot()
         live_key = account_key((snapshot or {}).get("oauthAccount"))
         sessions = self.sessions()
         if snapshot is not None and live_key not in sessions:
-            self.out(f"* {'(unsaved)':<16} {account_label(snapshot)}")
+            self.out(f"* {'(unsaved)':<16} {account_label(snapshot)}  (next switch asks for a nickname)")
         elif snapshot is None and self.pending() is not None:
             self.out(f"* {self.pending():<16} (awaiting login)")
         for key, sess in sorted(sessions.items(), key=lambda kv: kv[1]["nickname"]):
