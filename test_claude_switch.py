@@ -1,4 +1,5 @@
 import json
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -6,8 +7,10 @@ from pathlib import Path
 
 import claude_switch as cs
 
-ACCT_A = {"accountUuid": "uuid-a", "emailAddress": "a@x", "organizationName": "orgA"}
-ACCT_B = {"accountUuid": "uuid-b", "emailAddress": "b@y", "organizationName": "orgB"}
+ACCT_A = {"accountUuid": "ua", "organizationUuid": "oa", "emailAddress": "alice@x", "organizationName": "orgA"}
+ACCT_B = {"accountUuid": "ub", "organizationUuid": "ob", "emailAddress": "bob@y", "organizationName": "orgB"}
+# same account, different org: a separate login
+ACCT_A_TEAM = {**ACCT_A, "organizationUuid": "oteam", "organizationName": "team"}
 DEVICE = {"coworkRemoteDevice": {"id": "DEV"}}
 
 
@@ -20,13 +23,15 @@ class Base(unittest.TestCase):
         self.paths.store.mkdir()
         self.secure = cs.FileStore(self.paths.credentials)
         self.answers = []
+        self.questions = []
         self.output = []
 
     def tearDown(self):
         self._tmp.cleanup()
 
     def switcher(self, running=False):
-        def prompt(_question):
+        def prompt(question):
+            self.questions.append(question)
             if not self.answers:
                 raise EOFError
             return self.answers.pop(0)
@@ -41,6 +46,11 @@ class Base(unittest.TestCase):
         g["modelAccessCache"] = [token]
         self.paths.global_config.write_text(json.dumps(g))
 
+    def refresh(self, refresh_token):
+        creds = self.secure.read()
+        creds["claudeAiOauth"]["refreshToken"] = refresh_token
+        self.secure.write(creds)
+
     def global_config(self):
         p = self.paths.global_config
         return json.loads(p.read_text()) if p.exists() else None
@@ -49,47 +59,96 @@ class Base(unittest.TestCase):
         creds = self.secure.read() or {}
         return creds.get("claudeAiOauth", {}).get("accessToken")
 
+    def saved(self, account):
+        return json.loads(self.paths.store.joinpath(cs.account_key(account) + ".json").read_text())
+
+    def status(self):
+        self.output.clear()
+        self.switcher().list()
+        return self.output
+
 
 class TestSwitch(Base):
     def test_full_cycle(self):
         self.login("A", ACCT_A)
         self.answers = ["personal"]
         self.switcher().switch("work")
+        self.assertIn("alice@x", self.questions[0])
+        self.assertEqual(self.saved(ACCT_A)["nickname"], "personal")
 
         # fresh slot: logged out, device and unrelated config kept, caches dropped
         self.assertEqual(self.secure.read(), DEVICE)
         self.assertEqual(self.global_config(), {"projects": {"/x": {"trust": True}}, "machineID": "M"})
-        self.assertEqual(self.switcher().active_name(), "work")
+        self.assertEqual(self.status(), ["* work             (awaiting login)", "  personal         alice@x (orgA)"])
 
+        # the new login takes the pending nickname without asking
         self.login("B", ACCT_B)
-        self.switcher().pick()  # only one other session: no prompt
+        self.switcher().pick()
+        self.assertEqual(len(self.questions), 1)
+        self.assertEqual(self.saved(ACCT_B)["nickname"], "work")
+        self.assertFalse(self.paths.pending.exists())
         self.assertEqual(self.token(), "A")
         self.assertEqual(self.global_config()["oauthAccount"], ACCT_A)
         self.assertNotIn("modelAccessCache", self.global_config())
         self.assertEqual(self.secure.read()["coworkRemoteDevice"], DEVICE["coworkRemoteDevice"])
 
         # a refresh while on personal is captured on the next switch
-        creds = self.secure.read()
-        creds["claudeAiOauth"]["refreshToken"] = "R-rotated"
-        self.secure.write(creds)
+        self.refresh("R-rotated")
         self.switcher().switch("work")
         self.assertEqual(self.token(), "B")
-        saved = json.loads(self.paths.store.joinpath("personal.json").read_text())
+        saved = self.saved(ACCT_A)
         self.assertEqual(saved["credentials"]["claudeAiOauth"]["refreshToken"], "R-rotated")
         self.assertNotIn("coworkRemoteDevice", saved["credentials"])
+        self.assertEqual(self.status(), ["  personal         alice@x (orgA)", "* work             bob@y (orgB)"])
+
+    def test_manual_login_to_known_account_is_recognized(self):
+        self.login("A", ACCT_A)
+        self.answers = ["personal"]
+        self.switcher().switch("work")
+        self.login("B", ACCT_B)
+        self.switcher().switch("personal")
+        # user runs /login as bob by hand while on personal
+        self.login("B2", ACCT_B)
+        self.switcher().switch("personal")
+        self.assertEqual(len(self.questions), 1)
+        self.assertEqual(self.saved(ACCT_B)["credentials"]["claudeAiOauth"]["accessToken"], "B2")
+        self.assertEqual(self.saved(ACCT_A)["credentials"]["claudeAiOauth"]["accessToken"], "A")
+        self.assertEqual(self.token(), "A")
+
+    def test_same_account_other_org_is_separate(self):
+        self.login("A", ACCT_A)
+        self.answers = ["personal"]
+        self.switcher().switch("team")
+        self.login("T", ACCT_A_TEAM)
+        self.switcher().switch("personal")
+        self.assertEqual(self.saved(ACCT_A_TEAM)["nickname"], "team")
+        self.assertEqual(self.token(), "A")
+
+    def test_default_nickname_from_email(self):
+        self.login("A", {**ACCT_A, "emailAddress": "a+b.c@x"})
+        self.answers = [""]
+        self.switcher().switch("work")
+        self.assertTrue(self.questions[0].endswith("nickname [a-b.c]: "))
+        self.assertEqual(self.saved(ACCT_A)["nickname"], "a-b.c")
 
     def test_already_active(self):
         self.login("A", ACCT_A)
         self.answers = ["personal"]
         self.switcher().switch("work")
-        self.switcher().switch("work")
+        self.switcher(running=True).switch("work")
         self.assertEqual(self.output[-1], "already on 'work'")
+        self.login("B", ACCT_B)
+        self.switcher(running=True).switch("work")
+        self.assertEqual(self.output[-1], "already on 'work'")
+        self.assertEqual(self.saved(ACCT_B)["nickname"], "work")
 
     def test_refuses_when_running(self):
         self.login("A", ACCT_A)
+        self.answers = ["personal"]
         with self.assertRaisesRegex(cs.Error, "running"):
             self.switcher(running=True).switch("work")
         self.assertEqual(self.token(), "A")
+        self.assertIsNone(self.switcher().pending())
 
     def test_force_skips_running_check(self):
         self.login("A", ACCT_A)
@@ -97,55 +156,45 @@ class TestSwitch(Base):
         self.switcher(running=True).switch("work", force=True)
         self.assertIsNone(self.token())
 
-    def test_unmanaged_without_name_changes_nothing(self):
+    def test_unknown_login_without_nickname_changes_nothing(self):
         self.login("A", ACCT_A)
-        with self.assertRaisesRegex(cs.Error, "no name"):
+        with self.assertRaisesRegex(cs.Error, "no nickname"):
             self.switcher().switch("work")
         self.assertEqual(self.token(), "A")
-        self.assertEqual(self.switcher().session_names(), [])
+        self.assertEqual(self.switcher().sessions(), {})
 
-    def test_invalid_names(self):
-        with self.assertRaisesRegex(cs.Error, "invalid name"):
-            self.switcher().switch("a/b")
+    def test_login_without_oauth_account_aborts(self):
+        self.secure.write({"claudeAiOauth": {"accessToken": "X"}})
+        with self.assertRaisesRegex(cs.Error, "no oauthAccount"):
+            self.switcher().switch("work")
+        self.assertEqual(self.token(), "X")
+
+    def test_invalid_nicknames(self):
+        for bad in ["a/b", "-x", ""]:
+            with self.assertRaisesRegex(cs.Error, "invalid nickname"):
+                self.switcher().switch(bad) if bad else self.switcher().check_new_nickname(bad)
         self.login("A", ACCT_A)
         self.answers = ["../evil"]
-        with self.assertRaisesRegex(cs.Error, "invalid name"):
+        with self.assertRaisesRegex(cs.Error, "invalid nickname"):
             self.switcher().switch("work")
 
-    def test_save_name_must_not_collide(self):
-        self.login("A", ACCT_A)
-        self.answers = ["work"]
-        with self.assertRaisesRegex(cs.Error, "already exists"):
-            self.switcher().switch("work")
-
-    def test_manual_relogin_is_not_saved_under_wrong_name(self):
+    def test_nickname_must_be_unique(self):
         self.login("A", ACCT_A)
         self.answers = ["personal"]
         self.switcher().switch("work")
         self.login("B", ACCT_B)
         self.switcher().switch("personal")
-        # now on personal (A); user runs /login as B by hand
-        self.login("B2", ACCT_B)
-        self.answers = ["work2"]
-        self.switcher().switch("work")
-        saved_personal = json.loads(self.paths.store.joinpath("personal.json").read_text())
-        self.assertEqual(saved_personal["oauthAccount"], ACCT_A)
-        saved_work2 = json.loads(self.paths.store.joinpath("work2.json").read_text())
-        self.assertEqual(saved_work2["credentials"]["claudeAiOauth"]["accessToken"], "B2")
-
-    def test_logged_out_pending_slot_keeps_saved_session(self):
-        self.login("A", ACCT_A)
-        self.answers = ["personal"]
-        self.switcher().switch("work")  # work pending, never logged in
-        self.switcher().switch("personal")
-        self.assertEqual(self.token(), "A")
-        self.assertFalse(self.paths.store.joinpath("work.json").exists())
+        self.login("T", ACCT_A_TEAM)
+        self.answers = ["work"]
+        with self.assertRaisesRegex(cs.Error, "already taken"):
+            self.switcher().switch("personal")
 
     def test_rollback_when_global_write_fails(self):
         self.login("A", ACCT_A)
         self.answers = ["personal"]
         self.switcher().switch("work")
         self.login("B", ACCT_B)
+        self.switcher().switch("personal")
         before_global = self.paths.global_config.read_text()
 
         real = cs.write_atomic
@@ -158,12 +207,33 @@ class TestSwitch(Base):
         cs.write_atomic = failing
         try:
             with self.assertRaises(OSError):
-                self.switcher().switch("personal")
+                self.switcher().switch("work")
+        finally:
+            cs.write_atomic = real
+        self.assertEqual(self.token(), "A")
+        self.assertEqual(self.paths.global_config.read_text(), before_global)
+
+    def test_rollback_restores_pending(self):
+        self.login("A", ACCT_A)
+        self.answers = ["personal"]
+        self.switcher().switch("work")
+        self.login("B", ACCT_B)
+
+        real = cs.write_atomic
+
+        def failing(path, text):
+            if path == self.paths.pending:
+                raise OSError("disk full")
+            real(path, text)
+
+        cs.write_atomic = failing
+        try:
+            with self.assertRaises(OSError):
+                self.switcher().switch("third")
         finally:
             cs.write_atomic = real
         self.assertEqual(self.token(), "B")
-        self.assertEqual(self.paths.global_config.read_text(), before_global)
-        self.assertEqual(self.switcher().active_name(), "work")
+        self.assertEqual(self.global_config()["oauthAccount"], ACCT_B)
 
     def test_invalid_credentials_json_aborts(self):
         self.paths.credentials.write_text("{nope")
@@ -171,15 +241,10 @@ class TestSwitch(Base):
             self.switcher().switch("work")
         self.assertEqual(self.paths.credentials.read_text(), "{nope")
 
-    def test_list(self):
+    def test_status(self):
+        self.assertEqual(self.status(), ["not logged in, no saved sessions"])
         self.login("A", ACCT_A)
-        self.switcher().list()
-        self.assertEqual(self.output, ["* (unmanaged)"])
-        self.answers = ["personal"]
-        self.switcher().switch("work")
-        self.output.clear()
-        self.switcher().list()
-        self.assertEqual(self.output, ["  personal         a@x (orgA)", "* work (pending login)"])
+        self.assertEqual(self.status(), ["* (unsaved)        alice@x (orgA)"])
 
     def test_pick_multiple_prompts(self):
         self.login("A", ACCT_A)
@@ -187,10 +252,23 @@ class TestSwitch(Base):
         self.switcher().switch("b")
         self.login("B", ACCT_B)
         self.switcher().switch("c")
-        self.login("C", ACCT_A)
+        self.login("C", ACCT_A_TEAM)
         self.answers = ["b"]
         self.switcher().pick()
         self.assertEqual(self.token(), "B")
+
+    def test_rename(self):
+        self.login("A", ACCT_A)
+        self.answers = ["personal"]
+        self.switcher().switch("work")
+        self.switcher().rename("personal", "me")
+        self.switcher().rename("work", "job")
+        self.assertEqual(self.saved(ACCT_A)["nickname"], "me")
+        self.assertEqual(self.switcher().pending(), "job")
+        with self.assertRaisesRegex(cs.Error, "already taken"):
+            self.switcher().rename("me", "job")
+        with self.assertRaisesRegex(cs.Error, "no session"):
+            self.switcher().rename("nope", "x")
 
 
 class FakeSecurity:
@@ -210,8 +288,6 @@ class FakeSecurity:
                 return subprocess.CompletedProcess(cmd, 44, "", "not found")
             return subprocess.CompletedProcess(cmd, 0, self.items[key] + "\n", "")
         if cmd == ["security", "-i"]:
-            import shlex
-
             args = shlex.split(input)
             assert args[0] == "add-generic-password" and "-U" in args
             key = (args[args.index("-a") + 1], args[args.index("-s") + 1])
@@ -241,6 +317,7 @@ class TestKeychain(Base):
         with self.assertRaisesRegex(cs.Error, "keychain read failed"):
             self.switcher().switch("work")
         self.assertEqual(self.fake.items, {})
+        self.assertIsNone(self.switcher().pending())
 
     def test_write_verified(self):
         self.use_keychain(FakeSecurity(ignore_writes=True))

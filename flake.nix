@@ -22,7 +22,7 @@
         {
           claude-switch = pkgs.stdenvNoCC.mkDerivation {
             pname = "claude-switch";
-            version = "0.2.0";
+            version = "0.3.0";
             src = ./.;
             nativeBuildInputs = [ pkgs.makeWrapper ];
             buildInputs = [ pkgs.python3 ];
