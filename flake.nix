@@ -1,5 +1,5 @@
 {
-  description = "Switch between Claude Code subscription logins";
+  description = "Switch between Claude Code and Codex subscription logins";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
 
@@ -20,23 +20,28 @@
           pkgs = nixpkgs.legacyPackages.${system};
         in
         {
-          claude-switch = pkgs.stdenvNoCC.mkDerivation {
-            pname = "claude-switch";
-            version = "0.3.2";
+          agent-switcher = pkgs.stdenvNoCC.mkDerivation {
+            pname = "agent-switcher";
+            version = "0.4.0";
             src = ./.;
             nativeBuildInputs = [ pkgs.makeWrapper ];
             buildInputs = [ pkgs.python3 ];
             doCheck = true;
-            checkPhase = "${pkgs.python3}/bin/python3 -m unittest -v test_claude_switch";
-            installPhase = ''
-              install -Dm755 claude_switch.py $out/bin/claude-switch
-            '';
+            checkPhase = "${pkgs.python3}/bin/python3 -m unittest -v test_agent_switch";
             # macOS ships pgrep and security in /usr/bin
-            postFixup = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
-              wrapProgram $out/bin/claude-switch --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.procps ]}
+            pathPrefix = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux "--prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.procps ]}";
+            installPhase = ''
+              install -Dm755 agent_switch.py $out/libexec/agent_switch.py
+            '';
+            postFixup = ''
+              for tool in claude codex; do
+                makeWrapper $out/libexec/agent_switch.py $out/bin/$tool-switch \
+                  --add-flags "--tool $tool" $pathPrefix
+              done
             '';
           };
-          default = self.packages.${system}.claude-switch;
+          claude-switch = self.packages.${system}.agent-switcher;
+          default = self.packages.${system}.agent-switcher;
         }
       );
     };

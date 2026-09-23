@@ -1,3 +1,4 @@
+import base64
 import json
 import shlex
 import subprocess
@@ -5,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import claude_switch as cs
+import agent_switch as cs
 
 ACCT_A = {"accountUuid": "ua", "organizationUuid": "oa", "emailAddress": "alice@x", "organizationName": "orgA"}
 ACCT_B = {"accountUuid": "ub", "organizationUuid": "ob", "emailAddress": "bob@y", "organizationName": "orgB"}
@@ -19,9 +20,11 @@ class Base(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.home = Path(self._tmp.name)
         (self.home / ".claude").mkdir()
-        self.paths = cs.Paths({"HOME": str(self.home)})
-        self.paths.store.mkdir()
-        self.secure = cs.FileStore(self.paths.credentials)
+        self.tool = cs.ClaudeTool(
+            {"HOME": str(self.home)}, secure=cs.FileStore(self.home / ".claude" / ".credentials.json")
+        )
+        self.tool.store.mkdir()
+        self.secure = self.tool.secure
         self.answers = []
         self.questions = []
         self.output = []
@@ -36,7 +39,7 @@ class Base(unittest.TestCase):
                 raise EOFError
             return self.answers.pop(0)
 
-        return cs.Switcher(self.paths, self.secure, prompt=prompt, running=lambda: running, out=self.output.append)
+        return cs.Switcher(self.tool, prompt=prompt, running=lambda: running, out=self.output.append)
 
     def login(self, token, account):
         """Simulate Claude writing a fresh login."""
@@ -44,7 +47,7 @@ class Base(unittest.TestCase):
         g = self.global_config() or {"projects": {"/x": {"trust": True}}, "machineID": "M"}
         g["oauthAccount"] = account
         g["modelAccessCache"] = [token]
-        self.paths.global_config.write_text(json.dumps(g))
+        self.tool.global_config.write_text(json.dumps(g))
 
     def refresh(self, refresh_token):
         creds = self.secure.read()
@@ -52,7 +55,7 @@ class Base(unittest.TestCase):
         self.secure.write(creds)
 
     def global_config(self):
-        p = self.paths.global_config
+        p = self.tool.global_config
         return json.loads(p.read_text()) if p.exists() else None
 
     def token(self):
@@ -60,7 +63,7 @@ class Base(unittest.TestCase):
         return creds.get("claudeAiOauth", {}).get("accessToken")
 
     def saved(self, account):
-        return json.loads(self.paths.store.joinpath(cs.account_key(account) + ".json").read_text())
+        return json.loads(self.tool.store.joinpath(self.tool.key({"oauthAccount": account}) + ".json").read_text())
 
     def status(self):
         self.output.clear()
@@ -86,7 +89,7 @@ class TestSwitch(Base):
         self.switcher().pick()
         self.assertEqual(len(self.questions), 1)
         self.assertEqual(self.saved(ACCT_B)["nickname"], "work")
-        self.assertFalse(self.paths.pending.exists())
+        self.assertFalse((self.tool.store / "pending").exists())
         self.assertEqual(self.token(), "A")
         self.assertEqual(self.global_config()["oauthAccount"], ACCT_A)
         self.assertNotIn("modelAccessCache", self.global_config())
@@ -195,12 +198,12 @@ class TestSwitch(Base):
         self.switcher().switch("work")
         self.login("B", ACCT_B)
         self.switcher().switch("personal")
-        before_global = self.paths.global_config.read_text()
+        before_global = self.tool.global_config.read_text()
 
         real = cs.write_atomic
 
         def failing(path, text):
-            if path == self.paths.global_config:
+            if path == self.tool.global_config:
                 raise OSError("disk full")
             real(path, text)
 
@@ -211,7 +214,7 @@ class TestSwitch(Base):
         finally:
             cs.write_atomic = real
         self.assertEqual(self.token(), "A")
-        self.assertEqual(self.paths.global_config.read_text(), before_global)
+        self.assertEqual(self.tool.global_config.read_text(), before_global)
 
     def test_rollback_restores_pending(self):
         self.login("A", ACCT_A)
@@ -222,7 +225,7 @@ class TestSwitch(Base):
         real = cs.write_atomic
 
         def failing(path, text):
-            if path == self.paths.pending:
+            if path == (self.tool.store / "pending"):
                 raise OSError("disk full")
             real(path, text)
 
@@ -236,10 +239,10 @@ class TestSwitch(Base):
         self.assertEqual(self.global_config()["oauthAccount"], ACCT_B)
 
     def test_invalid_credentials_json_aborts(self):
-        self.paths.credentials.write_text("{nope")
+        self.secure.path.write_text("{nope")
         with self.assertRaisesRegex(cs.Error, "not valid JSON"):
             self.switcher().switch("work")
-        self.assertEqual(self.paths.credentials.read_text(), "{nope")
+        self.assertEqual(self.secure.path.read_text(), "{nope")
 
     def test_status(self):
         self.assertEqual(self.status(), ["not logged in, no saved sessions"])
@@ -257,7 +260,7 @@ class TestSwitch(Base):
         self.login("B", ACCT_B)
         self.assertEqual(self.status(), ["  personal         alice@x (orgA)", "* work             bob@y (orgB)"])
         self.assertEqual(self.saved(ACCT_B)["nickname"], "work")
-        self.assertFalse(self.paths.pending.exists())
+        self.assertFalse((self.tool.store / "pending").exists())
         self.assertEqual(len(self.questions), 1)
 
     def test_status_refreshes_known_account(self):
@@ -362,6 +365,7 @@ class TestKeychain(Base):
     def use_keychain(self, fake):
         self.fake = fake
         self.secure = cs.KeychainStore("mthq", "Claude Code-credentials", run=fake)
+        self.tool.secure = self.secure
 
     def test_cycle(self):
         self.use_keychain(FakeSecurity())
@@ -396,6 +400,155 @@ class TestKeychain(Base):
         self.assertEqual(cs.keychain_for({"USER": "bad name"}).account, "claude-code-user")
         svc = cs.keychain_for({"USER": "mthq", "CLAUDE_CONFIG_DIR": "/tmp/cfg"}).service
         self.assertRegex(svc, r"^Claude Code-credentials-[0-9a-f]{8}$")
+
+
+def fake_jwt(claims):
+    b64 = lambda d: base64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")
+    return f"{b64({'alg': 'none'})}.{b64(claims)}.sig"
+
+
+def codex_auth(token, user, account, email, plan="pro"):
+    claims = {
+        "email": email,
+        "sub": "sub-" + user,
+        "https://api.openai.com/auth": {
+            "chatgpt_user_id": user,
+            "chatgpt_account_id": account,
+            "chatgpt_plan_type": plan,
+        },
+    }
+    return {
+        "auth_mode": "chatgpt",
+        "OPENAI_API_KEY": None,
+        "tokens": {
+            "id_token": fake_jwt(claims),
+            "access_token": "AT-" + token,
+            "refresh_token": "RT-" + token,
+            "account_id": account,
+        },
+        "last_refresh": "2026-09-23T00:00:00Z",
+    }
+
+
+class TestCodex(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name) / ".codex"
+        self.home.mkdir()
+        self.tool = cs.CodexTool({"HOME": self._tmp.name})
+        self.tool.store.mkdir()
+        self.answers = []
+        self.output = []
+        self.running = False
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def switcher(self):
+        def prompt(_question):
+            if not self.answers:
+                raise EOFError
+            return self.answers.pop(0)
+
+        return cs.Switcher(self.tool, prompt=prompt, running=lambda: self.running, out=self.output.append)
+
+    def login(self, auth):
+        (self.home / "auth.json").write_text(json.dumps(auth))
+
+    def live(self):
+        p = self.home / "auth.json"
+        return json.loads(p.read_text()) if p.exists() else None
+
+    def test_cycle(self):
+        a = codex_auth("A", "user-a", "acct-a", "alice@x")
+        b = codex_auth("B", "user-b", "acct-b", "bob@y", plan="plus")
+        self.login(a)
+        self.answers = [""]
+        self.switcher().switch("work")
+        self.assertIsNone(self.live())
+        self.login(b)
+        self.switcher().switch("alice")
+        self.assertEqual(self.live(), a)
+        self.output.clear()
+        self.switcher().list()
+        self.assertEqual(self.output, ["* alice            alice@x (pro)", "  work             bob@y (plus)"])
+
+        # refreshed tokens are captured on the next switch
+        a["tokens"]["refresh_token"] = "RT-rotated"
+        self.login(a)
+        self.switcher().switch("work")
+        self.assertEqual(self.live(), b)
+        saved = json.loads((self.tool.store / "user-a.acct-a.json").read_text())
+        self.assertEqual(saved["credentials"]["tokens"]["refresh_token"], "RT-rotated")
+
+    def test_same_user_other_workspace_is_separate(self):
+        self.login(codex_auth("A", "user-a", "acct-a", "alice@x"))
+        self.answers = ["personal"]
+        self.switcher().switch("team")
+        self.login(codex_auth("T", "user-a", "acct-team", "alice@x"))
+        self.switcher().switch("personal")
+        self.assertEqual(len(self.switcher().sessions()), 2)
+
+    def test_running_codex_does_not_block_but_warns(self):
+        self.login(codex_auth("A", "user-a", "acct-a", "alice@x"))
+        self.answers = ["alice"]
+        self.running = True
+        self.switcher().switch("work")
+        self.assertIsNone(self.live())
+        self.assertIn("keep the old account until restarted", self.output[-1])
+
+    def test_api_key_login(self):
+        self.login({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-test-1234"})
+        self.output.clear()
+        self.switcher().list()
+        self.assertIn("API key …1234", self.output[0])
+        self.answers = [""]
+        self.switcher().switch("work")
+        self.assertEqual(self.switcher().sessions()["apikey." + cs.hashlib.sha256(b"sk-test-1234").hexdigest()[:16]]["nickname"], "apikey")
+
+    def test_rollback_restores_auth_file(self):
+        a = codex_auth("A", "user-a", "acct-a", "alice@x")
+        self.login(a)
+        self.answers = ["alice"]
+        self.switcher().switch("work")
+        self.login(codex_auth("B", "user-b", "acct-b", "bob@y"))
+        before = (self.home / "auth.json").read_text()
+
+        real = cs.write_atomic
+
+        def failing(path, text):
+            if path.name == "pending":
+                raise OSError("disk full")
+            real(path, text)
+
+        cs.write_atomic = failing
+        try:
+            with self.assertRaises(OSError):
+                self.switcher().switch("third")
+        finally:
+            cs.write_atomic = real
+        self.assertEqual((self.home / "auth.json").read_text(), before)
+
+    def test_keyring_mode_refused(self):
+        (self.home / "config.toml").write_text('model = "x"\ncli_auth_credentials_store = "keyring"\n')
+        with self.assertRaisesRegex(cs.Error, "only cli_auth_credentials_store"):
+            self.tool.check_supported()
+        (self.home / "config.toml").write_text('cli_auth_credentials_store = "file"\n')
+        self.tool.check_supported()
+
+    def test_codex_home_env(self):
+        tool = cs.CodexTool({"HOME": "/h", "CODEX_HOME": "/c"})
+        self.assertEqual(tool.auth_file, Path("/c/auth.json"))
+        self.assertEqual(tool.store, Path("/c/switch"))
+
+
+class TestMain(unittest.TestCase):
+    def test_tool_selection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"HOME": tmp}
+            self.assertEqual(cs.main(["--tool", "codex"], env), 0)
+            self.assertTrue((Path(tmp) / ".codex" / "switch").is_dir())
+            self.assertFalse((Path(tmp) / ".claude").exists())
 
 
 if __name__ == "__main__":
