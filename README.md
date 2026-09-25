@@ -22,6 +22,21 @@ To add an account, switch to a new nickname. That logs you out; log in (`claude`
 
 The macOS Keychain path is untested.
 
+## Stopping and resuming all sessions
+
+`claude-switch` refuses to run while any `claude` process is alive, including the
+background daemon that "push to background" leaves behind. To get out of the way
+in one go:
+
+```sh
+claude-park            # remember every interactive session, then stop them all
+claude-switch NICK
+claude-resume          # in a session's directory: `claude --resume` that session
+claude-resume --list   # or pick one by name / index from anywhere
+```
+
+Headless `claude -p` runs are left alone and reported.
+
 ## Install
 
 ```sh
