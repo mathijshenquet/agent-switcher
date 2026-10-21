@@ -35,13 +35,22 @@ class Error(Exception):
 
 
 def proc_start(pid: int):
-    """Kernel start time of pid (field 22 of /proc/pid/stat), or None."""
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
-    except OSError:
-        return None
-    # comm may contain spaces; it ends at the last ')'
-    return stat[stat.rindex(")") + 2 :].split()[19]
+    """Start time of pid in the form Claude Code records as procStart, or None."""
+    if sys.platform == "linux":
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+        except OSError:
+            return None
+        # field 22; comm may contain spaces, it ends at the last ')'
+        return stat[stat.rindex(")") + 2 :].split()[19]
+    # Claude Code records `ps -o lstart=` in UTC elsewhere (darwin)
+    r = subprocess.run(
+        ["ps", "-o", "lstart=", "-p", str(pid)],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},
+    )
+    return " ".join(r.stdout.split()) or None
 
 
 def live_sessions(sessions_dir: Path = SESSIONS_DIR, start_of=proc_start):
