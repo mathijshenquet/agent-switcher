@@ -4,7 +4,7 @@ and get each one back later, from its own directory, with `claude --resume`.
 
 Claude Code records every live process in ~/.claude/sessions/<pid>.json
 (pid, sessionId, cwd, kind). `claude-park` reads those, remembers the
-interactive ones in ~/.claude/switch/parked.json, then terminates the
+interactive ones in ~/.claude/parked.json, then terminates the
 sessions together with the background daemon and its pty hosts (the pieces
 that keep a session alive after "push to background"). `claude-resume` picks
 the parked session for the current directory (or by name/index) and execs
@@ -22,7 +22,9 @@ from pathlib import Path
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
 SESSIONS_DIR = CLAUDE_DIR / "sessions"
-PARKED_FILE = CLAUDE_DIR / "switch" / "parked.json"
+PARKED_FILE = CLAUDE_DIR / "parked.json"
+# 0.5.0 kept it in switch/, where claude-switch reads every *.json as a session.
+LEGACY_PARKED_FILE = CLAUDE_DIR / "switch" / "parked.json"
 # The daemon and pty hosts are the processes that outlive a terminal; they
 # do not carry a sessions/<pid>.json of their own.
 HELPER_PATTERN = r"claude (daemon run|bg-pty-host|bg-spare)"
@@ -61,10 +63,12 @@ def live_sessions(sessions_dir: Path = SESSIONS_DIR, start_of=proc_start):
 
 
 def load_parked():
-    try:
-        return json.loads(PARKED_FILE.read_text())
-    except (OSError, ValueError):
-        return []
+    for path in (PARKED_FILE, LEGACY_PARKED_FILE):
+        try:
+            return json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+    return []
 
 
 def save_parked(entries):
@@ -72,6 +76,7 @@ def save_parked(entries):
     tmp = PARKED_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(entries, indent=2) + "\n")
     os.replace(tmp, PARKED_FILE)
+    LEGACY_PARKED_FILE.unlink(missing_ok=True)
 
 
 def helper_pids():
