@@ -20,6 +20,7 @@ Codex (derived from openai/codex codex-rs/login), store $CODEX_HOME/switch:
 import argparse
 import base64
 import hashlib
+import fcntl
 import json
 import os
 import platform
@@ -35,7 +36,10 @@ NAME_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._-]*$")
 KEYCHAIN_NOT_FOUND = 44
 
 
-class Error(Exception):
+from claude_park import Error as ParkError
+
+
+class Error(ParkError):
     pass
 
 
@@ -345,19 +349,20 @@ class CodexTool:
 
 
 class Switcher:
-    def __init__(self, tool, prompt=input, running=None, out=print):
+    def __init__(self, tool, prompt=input, running=None, out=print, lifecycle=None):
         self.tool = tool
         self.store = tool.store
         self.pending_path = tool.store / "pending"
         self.prompt = prompt
         self.running = running or (lambda: process_running(tool.name))
         self.out = out
+        self.lifecycle = lifecycle
 
     # --- state -------------------------------------------------------------
 
     def sessions(self):
         """key -> session record, for every saved session."""
-        return {p.stem: load_json(p, f"session {p.name}") for p in sorted(self.store.glob("*.json"))}
+        return {p.stem: load_json(p, f"session {p.name}") for p in sorted(self.store.glob("*.json")) if p.name != "parked.json"}
 
     def key_for(self, nickname: str):
         for key, sess in self.sessions().items():
@@ -432,13 +437,19 @@ class Switcher:
             self.out(f"already on '{target}'")
             return
         running = self.running()
-        if running and self.tool.blocks_while_running and not force:
+        if running and self.tool.blocks_while_running and not force and self.lifecycle is None:
             raise Error(
                 f"{self.tool.name} is running; quit it first (it would write its old tokens back), or pass -f"
             )
 
         target_key = self.key_for(target)
         target_session = self.sessions()[target_key] if target_key else None
+        parked = self.lifecycle is not None and running and not force
+        if parked and self.lifecycle is not None:
+            self.lifecycle.park()
+            if self.running():
+                raise Error("Claude processes remain running; credentials unchanged; sessions remain parked")
+            self.capture_live()
         old_pending = read_text_or_none(self.pending_path)
 
         undo = self.tool.apply(target_session)
@@ -456,6 +467,10 @@ class Switcher:
             self.out(f"switched to '{target}': {self.tool.label(target_session)}")
         else:
             self.out(f"new session '{target}': {self.tool.login_hint}; it is saved on the next run")
+        if parked and target_session and self.lifecycle is not None:
+            self.lifecycle.restart()
+        elif parked:
+            self.out("sessions remain parked until the new account is logged in; use claude-resume")
         if running and not self.tool.blocks_while_running:
             self.out(f"note: running {self.tool.name} sessions keep the old account until restarted")
 
@@ -544,11 +559,24 @@ def main(argv=None, env=None) -> int:
     args = parser.parse_args(argv)
 
     old_umask = os.umask(0o077)
+    lock = None
     try:
         tool = TOOLS[tool_name](env)
         tool.check_supported()
         tool.store.mkdir(parents=True, exist_ok=True)
-        s = Switcher(tool)
+        lock = (tool.store / "lock").open("a")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Error("another switch is in progress; wait for it to finish") from None
+        def out(message):
+            print(message, flush=True)
+
+        lifecycle = None
+        if tool_name == "claude":
+            from claude_park import SwitchLifecycle
+            lifecycle = SwitchLifecycle(tool.cfg, out=out)
+        s = Switcher(tool, lifecycle=lifecycle, out=out)
         if args.rename:
             if len(args.rename) > 2:
                 parser.error("--rename takes [OLD] NEW")
@@ -562,10 +590,12 @@ def main(argv=None, env=None) -> int:
             s.switch(args.name, args.force)
         else:
             s.list()
-    except Error as e:
+    except (ParkError, OSError) as e:
         print(f"{tool_name}-switch: {e}", file=sys.stderr)
         return 1
     finally:
+        if lock is not None:
+            lock.close()
         os.umask(old_umask)
     return 0
 

@@ -15,10 +15,12 @@ import argparse
 import json
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
 SESSIONS_DIR = CLAUDE_DIR / "sessions"
@@ -71,21 +73,24 @@ def live_sessions(sessions_dir: Path = SESSIONS_DIR, start_of=proc_start):
     return out
 
 
-def load_parked():
-    for path in (PARKED_FILE, LEGACY_PARKED_FILE):
+def load_parked(path=None):
+    path = PARKED_FILE if path is None else path
+    legacy = path.parent / "switch" / "parked.json"
+    for candidate in (path, legacy):
         try:
-            return json.loads(path.read_text())
+            return json.loads(candidate.read_text())
         except (OSError, ValueError):
             continue
     return []
 
 
-def save_parked(entries):
-    PARKED_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = PARKED_FILE.with_suffix(".tmp")
+def save_parked(entries, path=None):
+    path = PARKED_FILE if path is None else path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(entries, indent=2) + "\n")
-    os.replace(tmp, PARKED_FILE)
-    LEGACY_PARKED_FILE.unlink(missing_ok=True)
+    os.replace(tmp, path)
+    (path.parent / "switch" / "parked.json").unlink(missing_ok=True)
 
 
 def helper_pids():
@@ -215,6 +220,174 @@ def main(argv=None) -> int:
     except Error as e:
         print(f"{tool}: {e}", file=sys.stderr)
         return 1
+
+
+
+class HerdrError(Error):
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
+
+
+class Herdr:
+    def __init__(self, run=subprocess.run, env=None):
+        self.run = run
+        self.env = dict(os.environ if env is None else env)
+        for key in list(self.env):
+            if key.startswith("HERDR_") and key != "HERDR_CONFIG_PATH":
+                del self.env[key]
+
+    def call(self, *args, session=None):
+        cmd = ["herdr"]
+        if session is not None:
+            cmd += ["--session", session]
+        try:
+            result = self.run(cmd + list(args), env=self.env, capture_output=True, text=True, timeout=45)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise Error(f"Herdr command failed: {e}") from e
+        if result.returncode:
+            try:
+                code = json.loads(result.stderr).get("error", {}).get("code")
+            except (ValueError, AttributeError):
+                code = None
+            raise HerdrError(f"Herdr {' '.join(args)}: {result.stderr.strip()}", code)
+
+        try:
+            payload = json.loads(result.stdout)
+            if "error" in payload:
+                raise Error(f"Herdr: {payload['error']}")
+            return payload.get("result", payload)
+        except (ValueError, AttributeError) as e:
+            raise Error("Herdr returned invalid JSON") from e
+
+    def discover(self, sessions):
+        found = {}
+        if not shutil.which("herdr"):
+            return found
+        by_pid = {s["pid"]: s for s in sessions}
+        for server in self.call("session", "list", "--json")["sessions"]:
+            if not server["running"]:
+                continue
+            name = server["name"]
+            for pane in self.call("agent", "list", session=name)["agents"]:
+                if pane.get("agent") != "claude":
+                    continue
+                info = self.call("pane", "process-info", "--pane", pane["pane_id"], session=name)["process_info"]
+                for proc in info.get("foreground_processes", []):
+                    source = by_pid.get(proc["pid"])
+                    if source is None:
+                        continue
+                    identity = pane.get("agent_session") or {}
+                    if identity.get("kind") == "id" and identity.get("value") != source["sessionId"]:
+                        raise Error(f"Herdr session identity changed in {name}/{pane['pane_id']}; retry")
+                    if not info.get("shell_pid"):
+                        raise Error(f"Herdr pane {name}/{pane['pane_id']} has no shell to restart in")
+                    found[source["sessionId"]] = {
+                        "session": name, "pane": pane["pane_id"], "terminal": pane["terminal_id"],
+                        "shell_pid": info["shell_pid"], "name": pane.get("name"),
+                        "args": restart_flags(proc.get("argv") or []),
+                    }
+        return found
+
+    def restart(self, entry):
+        target = entry["herdr"]
+        session, pane = target["session"], target["pane"]
+        deadline = time.monotonic() + 120
+        name = target.get("name") or "park-" + entry["sessionId"].replace("-", "")[:20]
+        while True:
+            current = self.call("pane", "get", pane, session=session)["pane"]
+            info = self.call("pane", "process-info", "--pane", pane, session=session)["process_info"]
+            if current["terminal_id"] != target["terminal"] or info.get("shell_pid") != target["shell_pid"]:
+                raise Error(f"Herdr pane {session}/{pane} was replaced; leaving session parked")
+            if current.get("foreground_cwd", current.get("cwd")) != entry["cwd"]:
+                raise Error(f"Herdr pane {session}/{pane} changed directory; leaving session parked")
+            processes = info.get("foreground_processes") or []
+            shell_ready = (info.get("foreground_process_group_id") == info["shell_pid"]
+                           and len(processes) == 1 and processes[0]["pid"] == info["shell_pid"])
+            if shell_ready:
+                try:
+                    self.call("agent", "start", name, "--kind", "claude", "--pane", pane,
+                              "--", *target.get("args", []), "--resume", entry["sessionId"], session=session)
+                    return
+                except HerdrError as e:
+                    # Herdr rejects busy panes before writing input, so only this error is safe to retry.
+                    if e.code != "agent_pane_busy":
+                        raise
+            if time.monotonic() >= deadline:
+                raise Error(f"Herdr pane {session}/{pane} did not become available; leaving session parked")
+            time.sleep(0.5)
+
+
+def restart_flags(argv):
+    flags = []
+    values = {"--model", "--permission-mode", "--effort"}
+    switches = {"--dangerously-skip-permissions", "--allow-dangerously-skip-permissions"}
+    args = iter(argv[1:])
+    for arg in args:
+        if arg in switches:
+            flags.append(arg)
+        elif arg in values:
+            value = next(args, None)
+            if value is not None:
+                flags.extend([arg, value])
+        elif any(arg.startswith(option + "=") for option in values):
+            flags.append(arg)
+    return flags
+
+
+class SwitchLifecycle:
+    def __init__(self, cfg, out=print, herdr=None):
+        self.cfg = cfg
+        self.path = cfg / "parked.json"
+        self.out = out
+        self.herdr = Herdr() if herdr is None else herdr
+        self.entries = []
+
+    def park(self):
+        if sys.platform != "linux":
+            raise Error("automatic parking currently requires Linux; quit Claude first")
+        sessions = live_sessions(self.cfg / "sessions")
+        others = [s for s in sessions if s.get("kind", "interactive") != "interactive"]
+        if others:
+            raise Error("headless Claude sessions are running; stop them before switching")
+        targets = self.herdr.discover(sessions)
+        self.entries = [
+            {"sessionId": s["sessionId"], "cwd": s.get("cwd", ""), "name": s.get("name", ""),
+             "parkedAt": int(time.time()), **({"herdr": targets[s["sessionId"]]} if s["sessionId"] in targets else {})}
+            for s in sessions
+        ]
+        ids = {e["sessionId"] for e in self.entries}
+        save_parked([e for e in load_parked(self.path) if e["sessionId"] not in ids] + self.entries, self.path)
+        for entry in self.entries:
+            self.out(f"parking {entry['name'] or entry['sessionId'][:8]}  {entry['cwd']}")
+        survivors = terminate([s["pid"] for s in sessions] + helper_pids())
+        survivors = terminate(survivors + helper_pids())
+        if survivors:
+            raise Error(f"could not stop Claude pids {survivors}; credentials unchanged")
+
+    def restart(self):
+        errors = []
+        entries = []
+        for entry in self.entries:
+            if "herdr" not in entry:
+                self.out(f"parked {entry['sessionId'][:8]}: use claude-resume in {entry['cwd']}")
+            else:
+                entries.append(entry)
+        if not entries:
+            return
+        with ThreadPoolExecutor(max_workers=len(entries)) as pool:
+            work = {pool.submit(self.herdr.restart, entry): entry for entry in entries}
+            for future in as_completed(work):
+                entry = work[future]
+                try:
+                    future.result()
+                except Error as e:
+                    errors.append(str(e))
+                    continue
+                save_parked([e for e in load_parked(self.path) if e["sessionId"] != entry["sessionId"]], self.path)
+                self.out(f"resumed {entry['sessionId'][:8]} in {entry['herdr']['session']}/{entry['herdr']['pane']}")
+        if errors:
+            raise Error("account switched, but some panes could not resume; use claude-resume --list: " + "; ".join(errors))
 
 
 if __name__ == "__main__":
