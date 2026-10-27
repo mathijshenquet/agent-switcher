@@ -551,9 +551,6 @@ class TestMain(unittest.TestCase):
             self.assertFalse((Path(tmp) / ".claude").exists())
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestIntegratedParking(Base):
     def prepare_accounts(self):
@@ -607,3 +604,28 @@ class TestIntegratedParking(Base):
         s.switch('new-account')
         lifecycle.park.assert_called_once()
         lifecycle.restart.assert_not_called()
+
+    def test_failed_apply_does_not_restart(self):
+        from unittest.mock import Mock, patch
+        self.prepare_accounts()
+        lifecycle = Mock()
+        running = iter([True, False])
+        s = cs.Switcher(self.tool, running=lambda: next(running), lifecycle=lifecycle)
+        with patch.object(self.tool, 'apply', side_effect=cs.Error('write failed')):
+            with self.assertRaisesRegex(cs.Error, 'write failed'):
+                s.switch('personal')
+        self.assertEqual(self.token(), 'B')
+        lifecycle.restart.assert_not_called()
+
+    def test_same_account_does_not_stop_anything(self):
+        from unittest.mock import Mock
+        self.prepare_accounts()
+        lifecycle = Mock()
+        s = cs.Switcher(self.tool, running=lambda: True, lifecycle=lifecycle)
+        s.switch('work')
+        lifecycle.park.assert_not_called()
+        lifecycle.restart.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

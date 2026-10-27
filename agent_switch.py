@@ -20,6 +20,7 @@ Codex (derived from openai/codex codex-rs/login), store $CODEX_HOME/switch:
 import argparse
 import base64
 import hashlib
+import fcntl
 import json
 import os
 import platform
@@ -444,7 +445,7 @@ class Switcher:
         target_key = self.key_for(target)
         target_session = self.sessions()[target_key] if target_key else None
         parked = self.lifecycle is not None and running and not force
-        if parked:
+        if parked and self.lifecycle is not None:
             self.lifecycle.park()
             if self.running():
                 raise Error("Claude processes remain running; credentials unchanged; sessions remain parked")
@@ -466,7 +467,7 @@ class Switcher:
             self.out(f"switched to '{target}': {self.tool.label(target_session)}")
         else:
             self.out(f"new session '{target}': {self.tool.login_hint}; it is saved on the next run")
-        if parked and target_session:
+        if parked and target_session and self.lifecycle is not None:
             self.lifecycle.restart()
         elif parked:
             self.out("sessions remain parked until the new account is logged in; use claude-resume")
@@ -558,10 +559,16 @@ def main(argv=None, env=None) -> int:
     args = parser.parse_args(argv)
 
     old_umask = os.umask(0o077)
+    lock = None
     try:
         tool = TOOLS[tool_name](env)
         tool.check_supported()
         tool.store.mkdir(parents=True, exist_ok=True)
+        lock = (tool.store / "lock").open("a")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Error("another switch is in progress; wait for it to finish") from None
         lifecycle = None
         if tool_name == "claude":
             from claude_park import SwitchLifecycle
@@ -584,6 +591,8 @@ def main(argv=None, env=None) -> int:
         print(f"{tool_name}-switch: {e}", file=sys.stderr)
         return 1
     finally:
+        if lock is not None:
+            lock.close()
         os.umask(old_umask)
     return 0
 

@@ -210,7 +210,7 @@ class Herdr:
         self.run = run
         self.env = dict(os.environ if env is None else env)
         for key in list(self.env):
-            if key.startswith("HERDR_"):
+            if key.startswith("HERDR_") and key != "HERDR_CONFIG_PATH":
                 del self.env[key]
 
     def call(self, *args, session=None):

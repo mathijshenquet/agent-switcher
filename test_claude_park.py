@@ -19,9 +19,6 @@ class LiveSessionsTest(unittest.TestCase):
             self.assertEqual([s["sessionId"] for s in live], ["a"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 from unittest.mock import Mock, patch
 import subprocess
@@ -115,3 +112,7 @@ class LifecycleTest(unittest.TestCase):
             h.restart.side_effect = None
             lifecycle.restart()
             self.assertEqual(claude_park.load_parked(lifecycle.path), [])
+
+
+if __name__ == "__main__":
+    unittest.main()
