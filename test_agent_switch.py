@@ -553,3 +553,57 @@ class TestMain(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestIntegratedParking(Base):
+    def prepare_accounts(self):
+        self.login('A', ACCT_A)
+        self.answers = ['personal']
+        self.switcher().switch('work')
+        self.login('B', ACCT_B)
+        self.switcher().capture_live()
+
+    def test_park_switch_restart_order_and_capture_final_tokens(self):
+        from unittest.mock import Mock
+        self.prepare_accounts()
+        lifecycle = Mock()
+        running = [True]
+
+        def park():
+            self.assertEqual(self.token(), 'B')
+            self.refresh('final-refresh')
+            running[0] = False
+
+        def restart():
+            self.assertEqual(self.token(), 'A')
+            self.assertEqual(self.saved(ACCT_B)['credentials']['claudeAiOauth']['refreshToken'], 'final-refresh')
+
+        lifecycle.park.side_effect = park
+        lifecycle.restart.side_effect = restart
+        s = cs.Switcher(self.tool, running=lambda: running[0], lifecycle=lifecycle, out=self.output.append)
+        s.switch('personal')
+        lifecycle.park.assert_called_once()
+        lifecycle.restart.assert_called_once()
+
+    def test_remaining_process_blocks_credential_change(self):
+        from unittest.mock import Mock
+        self.prepare_accounts()
+        lifecycle = Mock()
+        s = cs.Switcher(self.tool, running=lambda: True, lifecycle=lifecycle)
+        with self.assertRaisesRegex(cs.Error, 'remain running'):
+            s.switch('personal')
+        self.assertEqual(self.token(), 'B')
+        lifecycle.restart.assert_not_called()
+
+    def test_new_login_does_not_restart_and_status_ignores_parked(self):
+        from unittest.mock import Mock
+        self.prepare_accounts()
+        (self.tool.store / 'parked.json').write_text('[{"sessionId": "conversation"}]')
+        self.assertEqual(len(self.switcher().sessions()), 2)
+        self.switcher().list()
+        lifecycle = Mock()
+        running = iter([True, False])
+        s = cs.Switcher(self.tool, running=lambda: next(running), lifecycle=lifecycle)
+        s.switch('new-account')
+        lifecycle.park.assert_called_once()
+        lifecycle.restart.assert_not_called()
