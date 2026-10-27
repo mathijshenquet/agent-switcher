@@ -17,14 +17,14 @@ Sessions are keyed by account (and org/workspace), so a nickname is just a label
 
 To add an account, switch to a new nickname. That logs you out; log in (`claude` → `/login`, or `codex login`) and the next run saves the new login under that nickname.
 
-- **Claude**: swaps the OAuth credentials (`~/.claude/.credentials.json`, or the Keychain on macOS) and `oauthAccount` in `~/.claude.json`, and drops the account-scoped caches that `/logout` also clears. Saved sessions live in `~/.claude/switch/`. On Linux, switching automatically parks interactive Claude sessions and resumes those in Herdr after the account changes. Headless runs block the switch. `-f` bypasses parking and the process check; running sessions can then write old tokens back.
+- **Claude**: swaps the OAuth credentials (`~/.claude/.credentials.json`, or the Keychain on macOS) and `oauthAccount` in `~/.claude.json`, and drops the account-scoped caches that `/logout` also clears. Saved sessions live in `~/.claude/switch/`. On Linux and macOS, switching automatically parks interactive Claude sessions and resumes those in Herdr after the account changes. Headless runs block the switch. `-f` bypasses parking and the process check; running sessions can then write old tokens back.
 - **Codex**: swaps `$CODEX_HOME/auth.json` (default `~/.codex`). Saved sessions live in `$CODEX_HOME/switch/`. Running `codex` sessions can stay open: they refuse to refresh once the account changes, so restart them to use the new one. Only the default file credential store is supported.
 
 The macOS Keychain path is untested.
 
 ## Stopping and resuming all sessions
 
-On Linux, `claude-switch NICK` automatically remembers and stops interactive
+On Linux and macOS, `claude-switch NICK` automatically remembers and stops interactive
 Claude sessions before changing accounts. It discovers every running local Herdr
 session belonging to your user, matches Claude processes to panes, and resumes
 each conversation in its original pane with `claude --resume ID`. All pane
@@ -40,8 +40,9 @@ it does not automatically submit a prompt or continue an interrupted turn.
 Sessions outside Herdr, and panes whose restart fails, remain parked for manual
 recovery. A replaced pane or changed shell directory is never reused. If switching
 to a new nickname, log in first and resume manually. A failed switch also leaves
-sessions parked. On macOS, quit Claude before switching; automatic parking uses
-Linux process metadata.
+sessions parked. The Chrome native messaging host is also stopped so no old
+Claude process remains alive across an account switch. Chrome can reconnect
+when its Claude integration is next used.
 
 ```sh
 claude-switch NICK     # park, switch, resume Herdr panes

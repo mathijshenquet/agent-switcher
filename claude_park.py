@@ -29,7 +29,7 @@ PARKED_FILE = CLAUDE_DIR / "parked.json"
 LEGACY_PARKED_FILE = CLAUDE_DIR / "switch" / "parked.json"
 # The daemon and pty hosts are the processes that outlive a terminal; they
 # do not carry a sessions/<pid>.json of their own.
-HELPER_PATTERN = r"claude (daemon run|bg-pty-host|bg-spare)"
+HELPER_PATTERN = r"claude (daemon run|bg-pty-host|bg-spare|--chrome-native-host)"
 
 
 class Error(Exception):
@@ -344,8 +344,8 @@ class SwitchLifecycle:
         self.entries = []
 
     def park(self):
-        if sys.platform != "linux":
-            raise Error("automatic parking currently requires Linux; quit Claude first")
+        if sys.platform not in ("linux", "darwin"):
+            raise Error("automatic parking requires Linux or macOS; quit Claude first")
         sessions = live_sessions(self.cfg / "sessions")
         others = [s for s in sessions if s.get("kind", "interactive") != "interactive"]
         if others:

@@ -25,7 +25,6 @@ import json
 import os
 import platform
 import re
-import shlex
 import subprocess
 import sys
 import tempfile
@@ -82,23 +81,10 @@ def email_nickname(email) -> str:
 
 
 def process_running(name: str) -> bool:
-    r = subprocess.run(["pgrep", "-x", "-u", str(os.getuid()), name], capture_output=True, text=True)
+    r = subprocess.run(["pgrep", "-x", "-u", str(os.getuid()), name], capture_output=True)
     if r.returncode not in (0, 1):
         raise Error(f"pgrep failed (exit {r.returncode})")
-    if name != "claude" or r.returncode == 1:
-        return r.returncode == 0
-    for pid in r.stdout.split():
-        proc = subprocess.run(["ps", "-p", pid, "-o", "args="], capture_output=True, text=True)
-        if proc.returncode:
-            return True
-        try:
-            argv = shlex.split(proc.stdout)
-        except ValueError:
-            return True
-        # Chrome's native messaging host has no login session or OAuth refresh loop.
-        if len(argv) != 2 or argv[1] != "--chrome-native-host":
-            return True
-    return False
+    return r.returncode == 0
 
 
 # --- secure storage ----------------------------------------------------------

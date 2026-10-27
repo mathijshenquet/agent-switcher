@@ -5,7 +5,6 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 import agent_switch as cs
 
@@ -14,36 +13,6 @@ ACCT_B = {"accountUuid": "ub", "organizationUuid": "ob", "emailAddress": "bob@y"
 # same account, different org: a separate login
 ACCT_A_TEAM = {**ACCT_A, "organizationUuid": "oteam", "organizationName": "team"}
 DEVICE = {"coworkRemoteDevice": {"id": "DEV"}}
-
-
-class TestProcessRunning(unittest.TestCase):
-    def detect(self, commands):
-        results = [subprocess.CompletedProcess([], 0, "\n".join(str(i) for i in range(len(commands))), "")]
-        results.extend(subprocess.CompletedProcess([], 0, command, "") for command in commands)
-        with patch("agent_switch.subprocess.run", side_effect=results):
-            return cs.process_running("claude")
-
-    def test_chrome_native_host_does_not_block(self):
-        self.assertFalse(self.detect(["/Users/test/.local/bin/claude --chrome-native-host\n"]))
-
-    def test_interactive_and_headless_sessions_still_block(self):
-        for command in ["claude", "claude --resume abc", "claude -p hello", "claude -p --chrome-native-host"]:
-            with self.subTest(command=command):
-                self.assertTrue(self.detect(["claude --chrome-native-host", command]))
-
-    def test_unreadable_command_still_blocks(self):
-        with patch("agent_switch.subprocess.run", side_effect=[
-            subprocess.CompletedProcess([], 0, "123\n", ""),
-            subprocess.CompletedProcess([], 1, "", "failed"),
-        ]):
-            self.assertTrue(cs.process_running("claude"))
-
-    def test_no_process_and_codex_do_not_need_ps(self):
-        for name, code in [("claude", 1), ("codex", 0), ("codex", 1)]:
-            with self.subTest(name=name, code=code), patch("agent_switch.subprocess.run", return_value=
-                    subprocess.CompletedProcess([], code, "123\n" if code == 0 else "", "")) as run:
-                self.assertEqual(cs.process_running(name), code == 0)
-                run.assert_called_once()
 
 
 class Base(unittest.TestCase):

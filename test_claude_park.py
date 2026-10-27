@@ -8,6 +8,14 @@ import claude_park
 
 
 class LiveSessionsTest(unittest.TestCase):
+    @mock.patch("claude_park.sys.platform", "darwin")
+    def test_macos_start_time_matches_claude_format(self):
+        with mock.patch("claude_park.subprocess.run", return_value=
+                        subprocess.CompletedProcess([], 0, "Tue Oct 27  09:24:28 2026\n", "")) as run:
+            self.assertEqual(claude_park.proc_start(123), "Tue Oct 27 09:24:28 2026")
+            self.assertEqual(run.call_args.kwargs["env"]["TZ"], "UTC")
+            self.assertEqual(run.call_args.kwargs["env"]["LC_ALL"], "C")
+
     def test_filters_dead_and_reused_pids(self):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
@@ -84,12 +92,12 @@ class HerdrTest(unittest.TestCase):
 
 
 class LifecycleTest(unittest.TestCase):
-    @patch("claude_park.sys.platform", "darwin")
+    @patch("claude_park.sys.platform", "win32")
     def test_unsupported_platform_stops_before_discovery_or_signals(self):
         h = Mock()
         lifecycle = claude_park.SwitchLifecycle(Path("/unused"), herdr=h)
         with patch("claude_park.live_sessions") as sessions, patch("claude_park.terminate") as stop:
-            with self.assertRaisesRegex(claude_park.Error, "requires Linux"):
+            with self.assertRaisesRegex(claude_park.Error, "requires Linux or macOS"):
                 lifecycle.park()
             sessions.assert_not_called()
             h.discover.assert_not_called()
@@ -126,6 +134,27 @@ class LifecycleTest(unittest.TestCase):
             h.restart.side_effect = None
             lifecycle.restart()
             self.assertEqual(claude_park.load_parked(lifecycle.path), [])
+
+    @patch("claude_park.sys.platform", "darwin")
+    def test_macos_parks_sessions_and_browser_helper(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = Mock()
+            h.discover.return_value = {}
+            lifecycle = claude_park.SwitchLifecycle(Path(d), out=lambda _: None, herdr=h)
+            sessions = [{"pid": 123, "sessionId": "a", "cwd": "/work"}]
+            with patch("claude_park.live_sessions", return_value=sessions), \
+                    patch("claude_park.helper_pids", return_value=[456]), \
+                    patch("claude_park.terminate", return_value=[]) as stop:
+                lifecycle.park()
+            self.assertEqual(stop.call_args_list[0].args[0], [123, 456])
+            self.assertEqual(claude_park.load_parked(lifecycle.path)[0]["sessionId"], "a")
+            h.discover.assert_called_once_with(sessions)
+
+    def test_browser_native_host_is_a_helper(self):
+        import re
+        self.assertIsNotNone(re.search(claude_park.HELPER_PATTERN,
+                                      "/Users/test/.local/bin/claude --chrome-native-host"))
+        self.assertIsNone(re.search(claude_park.HELPER_PATTERN, "claude --resume abc"))
 
 
 class ParallelRestoreTest(unittest.TestCase):
