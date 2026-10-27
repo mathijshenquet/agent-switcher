@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import claude_park
 
@@ -178,6 +179,24 @@ class ParallelRestoreTest(unittest.TestCase):
                         with self.assertRaises(claude_park.HerdrError):
                             h.restart(self.entry())
                         self.assertEqual(h.call.call_count, 3)
+
+
+class ParkedFileTest(unittest.TestCase):
+    def test_migrates_out_of_switch_store(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            legacy = d / "switch" / "parked.json"
+            legacy.parent.mkdir()
+            legacy.write_text(json.dumps([{"sessionId": "a"}]))
+            with (
+                mock.patch.object(claude_park, "PARKED_FILE", d / "parked.json"),
+                mock.patch.object(claude_park, "LEGACY_PARKED_FILE", legacy),
+            ):
+                entries = claude_park.load_parked()
+                self.assertEqual(entries, [{"sessionId": "a"}])
+                claude_park.save_parked(entries)
+                self.assertFalse(legacy.exists())
+                self.assertEqual(claude_park.load_parked(), [{"sessionId": "a"}])
 
 
 if __name__ == "__main__":

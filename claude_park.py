@@ -4,7 +4,7 @@ and get each one back later, from its own directory, with `claude --resume`.
 
 Claude Code records every live process in ~/.claude/sessions/<pid>.json
 (pid, sessionId, cwd, kind). `claude-park` reads those, remembers the
-interactive ones in ~/.claude/switch/parked.json, then terminates the
+interactive ones in ~/.claude/parked.json, then terminates the
 sessions together with the background daemon and its pty hosts (the pieces
 that keep a session alive after "push to background"). `claude-resume` picks
 the parked session for the current directory (or by name/index) and execs
@@ -24,7 +24,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
 SESSIONS_DIR = CLAUDE_DIR / "sessions"
-PARKED_FILE = CLAUDE_DIR / "switch" / "parked.json"
+PARKED_FILE = CLAUDE_DIR / "parked.json"
+# 0.5.0 kept it in switch/, where claude-switch reads every *.json as a session.
+LEGACY_PARKED_FILE = CLAUDE_DIR / "switch" / "parked.json"
 # The daemon and pty hosts are the processes that outlive a terminal; they
 # do not carry a sessions/<pid>.json of their own.
 HELPER_PATTERN = r"claude (daemon run|bg-pty-host|bg-spare)"
@@ -35,13 +37,22 @@ class Error(Exception):
 
 
 def proc_start(pid: int):
-    """Kernel start time of pid (field 22 of /proc/pid/stat), or None."""
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
-    except OSError:
-        return None
-    # comm may contain spaces; it ends at the last ')'
-    return stat[stat.rindex(")") + 2 :].split()[19]
+    """Start time of pid in the form Claude Code records as procStart, or None."""
+    if sys.platform == "linux":
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+        except OSError:
+            return None
+        # field 22; comm may contain spaces, it ends at the last ')'
+        return stat[stat.rindex(")") + 2 :].split()[19]
+    # Claude Code records `ps -o lstart=` in UTC elsewhere (darwin)
+    r = subprocess.run(
+        ["ps", "-o", "lstart=", "-p", str(pid)],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},
+    )
+    return " ".join(r.stdout.split()) or None
 
 
 def live_sessions(sessions_dir: Path = SESSIONS_DIR, start_of=proc_start):
@@ -62,18 +73,24 @@ def live_sessions(sessions_dir: Path = SESSIONS_DIR, start_of=proc_start):
     return out
 
 
-def load_parked(path=PARKED_FILE):
-    try:
-        return json.loads(path.read_text())
-    except (OSError, ValueError):
-        return []
+def load_parked(path=None):
+    path = PARKED_FILE if path is None else path
+    legacy = path.parent / "switch" / "parked.json"
+    for candidate in (path, legacy):
+        try:
+            return json.loads(candidate.read_text())
+        except (OSError, ValueError):
+            continue
+    return []
 
 
-def save_parked(entries, path=PARKED_FILE):
+def save_parked(entries, path=None):
+    path = PARKED_FILE if path is None else path
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(entries, indent=2) + "\n")
     os.replace(tmp, path)
+    (path.parent / "switch" / "parked.json").unlink(missing_ok=True)
 
 
 def helper_pids():
@@ -321,7 +338,7 @@ def restart_flags(argv):
 class SwitchLifecycle:
     def __init__(self, cfg, out=print, herdr=None):
         self.cfg = cfg
-        self.path = cfg / "switch" / "parked.json"
+        self.path = cfg / "parked.json"
         self.out = out
         self.herdr = Herdr() if herdr is None else herdr
         self.entries = []
