@@ -84,6 +84,18 @@ class HerdrTest(unittest.TestCase):
 
 
 class LifecycleTest(unittest.TestCase):
+    @patch("claude_park.sys.platform", "darwin")
+    def test_unsupported_platform_stops_before_discovery_or_signals(self):
+        h = Mock()
+        lifecycle = claude_park.SwitchLifecycle(Path("/unused"), herdr=h)
+        with patch("claude_park.live_sessions") as sessions, patch("claude_park.terminate") as stop:
+            with self.assertRaisesRegex(claude_park.Error, "requires Linux"):
+                lifecycle.park()
+            sessions.assert_not_called()
+            h.discover.assert_not_called()
+            stop.assert_not_called()
+
+    @patch("claude_park.sys.platform", "linux")
     def test_headless_blocks_before_discovery_or_signals(self):
         h = Mock()
         lifecycle = claude_park.SwitchLifecycle(Path('/unused'), herdr=h)
@@ -93,6 +105,7 @@ class LifecycleTest(unittest.TestCase):
             h.discover.assert_not_called()
             stop.assert_not_called()
 
+    @patch("claude_park.sys.platform", "linux")
     def test_save_before_stop_and_keep_failed_restarts(self):
         with tempfile.TemporaryDirectory() as d:
             h = Mock()
