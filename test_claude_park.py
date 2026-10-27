@@ -66,7 +66,7 @@ class HerdrTest(unittest.TestCase):
                 h = claude_park.Herdr()
                 h.call = Mock(side_effect=[
                     {"pane": {"terminal_id": terminal, "cwd": cwd}},
-                    {"process_info": {"shell_pid": shell, "foreground_process_group_id": shell}}, {}])
+                    {"process_info": {"shell_pid": shell, "foreground_process_group_id": shell, "foreground_processes": [{"pid": shell}]}}, {}])
                 if valid:
                     h.restart(entry)
                     self.assertEqual(h.call.call_args.args[-5:], ("--", "--permission-mode", "plan", "--resume", "abc"))
@@ -112,6 +112,72 @@ class LifecycleTest(unittest.TestCase):
             h.restart.side_effect = None
             lifecycle.restart()
             self.assertEqual(claude_park.load_parked(lifecycle.path), [])
+
+
+class ParallelRestoreTest(unittest.TestCase):
+    def test_all_starts_overlap_and_only_coordinator_writes_state(self):
+        import threading
+        with tempfile.TemporaryDirectory() as d:
+            barrier = threading.Barrier(6)
+            coordinator = threading.get_ident()
+            h = Mock()
+            lifecycle = claude_park.SwitchLifecycle(Path(d), out=lambda _: None, herdr=h)
+            lifecycle.entries = [{"sessionId": str(i), "cwd": "/work", "herdr": {
+                "session": "one", "pane": str(i)}} for i in range(6)]
+            manual = {"sessionId": "manual", "cwd": "/elsewhere"}
+            claude_park.save_parked([*lifecycle.entries, manual], lifecycle.path)
+            lifecycle.entries.append(manual)
+
+            def restart(entry):
+                barrier.wait(timeout=3)
+                if entry["sessionId"] == "2":
+                    raise claude_park.Error("startup failed")
+
+            save = claude_park.save_parked
+
+            def coordinated_save(*args):
+                self.assertEqual(threading.get_ident(), coordinator)
+                return save(*args)
+
+            h.restart.side_effect = restart
+            with patch("claude_park.save_parked", side_effect=coordinated_save):
+                with self.assertRaisesRegex(claude_park.Error, "startup failed"):
+                    lifecycle.restart()
+            self.assertEqual({e["sessionId"] for e in claude_park.load_parked(lifecycle.path)}, {"2", "manual"})
+
+    def entry(self):
+        return {"sessionId": "abc", "cwd": "/work", "herdr": {
+            "session": "one", "pane": "w1:p1", "terminal": "term1", "shell_pid": 10}}
+
+    def responses(self):
+        return [{"pane": {"terminal_id": "term1", "cwd": "/work"}},
+                {"process_info": {"shell_pid": 10, "foreground_process_group_id": 10,
+                                  "foreground_processes": [{"pid": 10}]}}]
+
+    def test_waits_for_shell_children_to_finish(self):
+        busy = self.responses()
+        busy[1]["process_info"]["foreground_processes"].append({"pid": 11})
+        h = claude_park.Herdr()
+        h.call = Mock(side_effect=[*busy, *self.responses(), {}])
+        with patch("claude_park.time.sleep") as sleep:
+            h.restart(self.entry())
+        sleep.assert_called_once()
+        self.assertEqual([c.args[:2] for c in h.call.call_args_list].count(("agent", "start")), 1)
+
+    def test_only_busy_errors_are_retried(self):
+        for code in ("agent_pane_busy", "agent_not_ready"):
+            with self.subTest(code=code):
+                h = claude_park.Herdr()
+                h.call = Mock(side_effect=[*self.responses(), claude_park.HerdrError("failed", code),
+                                          *self.responses(), {}])
+                with patch("claude_park.time.sleep"):
+                    if code == "agent_pane_busy":
+                        h.restart(self.entry())
+                        self.assertEqual(h.call.call_count, 6)
+                    else:
+                        with self.assertRaises(claude_park.HerdrError):
+                            h.restart(self.entry())
+                        self.assertEqual(h.call.call_count, 3)
 
 
 if __name__ == "__main__":

@@ -27,7 +27,9 @@ The macOS Keychain path is untested.
 On Linux, `claude-switch NICK` automatically remembers and stops interactive
 Claude sessions before changing accounts. It discovers every running local Herdr
 session belonging to your user, matches Claude processes to panes, and resumes
-each conversation in its original pane with `claude --resume ID`. Other agent
+each conversation in its original pane with `claude --resume ID`. All pane
+restarts run concurrently; readiness checks overlap. Shell initialization such
+as direnv/devenv is allowed up to 120 seconds before a pane is left parked. Other agent
 kinds and remote machines are not restarted. Herdr itself stays running.
 
 Resuming preserves the model, effort and permission-mode options (including

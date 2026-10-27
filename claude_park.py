@@ -20,6 +20,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
 SESSIONS_DIR = CLAUDE_DIR / "sessions"
@@ -205,6 +206,12 @@ def main(argv=None) -> int:
 
 
 
+class HerdrError(Error):
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
+
+
 class Herdr:
     def __init__(self, run=subprocess.run, env=None):
         self.run = run
@@ -222,7 +229,12 @@ class Herdr:
         except (OSError, subprocess.TimeoutExpired) as e:
             raise Error(f"Herdr command failed: {e}") from e
         if result.returncode:
-            raise Error(f"Herdr {' '.join(args)}: {result.stderr.strip()}")
+            try:
+                code = json.loads(result.stderr).get("error", {}).get("code")
+            except (ValueError, AttributeError):
+                code = None
+            raise HerdrError(f"Herdr {' '.join(args)}: {result.stderr.strip()}", code)
+
         try:
             payload = json.loads(result.stdout)
             if "error" in payload:
@@ -263,22 +275,30 @@ class Herdr:
     def restart(self, entry):
         target = entry["herdr"]
         session, pane = target["session"], target["pane"]
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 120
+        name = target.get("name") or "park-" + entry["sessionId"].replace("-", "")[:20]
         while True:
             current = self.call("pane", "get", pane, session=session)["pane"]
             info = self.call("pane", "process-info", "--pane", pane, session=session)["process_info"]
             if current["terminal_id"] != target["terminal"] or info.get("shell_pid") != target["shell_pid"]:
                 raise Error(f"Herdr pane {session}/{pane} was replaced; leaving session parked")
-            if info.get("foreground_process_group_id") == info["shell_pid"]:
-                break
+            if current.get("foreground_cwd", current.get("cwd")) != entry["cwd"]:
+                raise Error(f"Herdr pane {session}/{pane} changed directory; leaving session parked")
+            processes = info.get("foreground_processes") or []
+            shell_ready = (info.get("foreground_process_group_id") == info["shell_pid"]
+                           and len(processes) == 1 and processes[0]["pid"] == info["shell_pid"])
+            if shell_ready:
+                try:
+                    self.call("agent", "start", name, "--kind", "claude", "--pane", pane,
+                              "--", *target.get("args", []), "--resume", entry["sessionId"], session=session)
+                    return
+                except HerdrError as e:
+                    # Herdr rejects busy panes before writing input, so only this error is safe to retry.
+                    if e.code != "agent_pane_busy":
+                        raise
             if time.monotonic() >= deadline:
-                raise Error(f"Herdr pane {session}/{pane} did not return to its shell; leaving session parked")
-            time.sleep(0.2)
-        if current.get("foreground_cwd", current.get("cwd")) != entry["cwd"]:
-            raise Error(f"Herdr pane {session}/{pane} changed directory; leaving session parked")
-        name = target.get("name") or "park-" + entry["sessionId"].replace("-", "")[:20]
-        self.call("agent", "start", name, "--kind", "claude", "--pane", pane,
-                  "--", *target.get("args", []), "--resume", entry["sessionId"], session=session)
+                raise Error(f"Herdr pane {session}/{pane} did not become available; leaving session parked")
+            time.sleep(0.5)
 
 
 def restart_flags(argv):
@@ -330,17 +350,25 @@ class SwitchLifecycle:
 
     def restart(self):
         errors = []
+        entries = []
         for entry in self.entries:
             if "herdr" not in entry:
                 self.out(f"parked {entry['sessionId'][:8]}: use claude-resume in {entry['cwd']}")
-                continue
-            try:
-                self.herdr.restart(entry)
-            except Error as e:
-                errors.append(str(e))
-                continue
-            save_parked([e for e in load_parked(self.path) if e["sessionId"] != entry["sessionId"]], self.path)
-            self.out(f"resumed {entry['sessionId'][:8]} in {entry['herdr']['session']}/{entry['herdr']['pane']}")
+            else:
+                entries.append(entry)
+        if not entries:
+            return
+        with ThreadPoolExecutor(max_workers=len(entries)) as pool:
+            work = {pool.submit(self.herdr.restart, entry): entry for entry in entries}
+            for future in as_completed(work):
+                entry = work[future]
+                try:
+                    future.result()
+                except Error as e:
+                    errors.append(str(e))
+                    continue
+                save_parked([e for e in load_parked(self.path) if e["sessionId"] != entry["sessionId"]], self.path)
+                self.out(f"resumed {entry['sessionId'][:8]} in {entry['herdr']['session']}/{entry['herdr']['pane']}")
         if errors:
             raise Error("account switched, but some panes could not resume; use claude-resume --list: " + "; ".join(errors))
 

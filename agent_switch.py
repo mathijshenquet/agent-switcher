@@ -569,11 +569,14 @@ def main(argv=None, env=None) -> int:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise Error("another switch is in progress; wait for it to finish") from None
+        def out(message):
+            print(message, flush=True)
+
         lifecycle = None
         if tool_name == "claude":
             from claude_park import SwitchLifecycle
-            lifecycle = SwitchLifecycle(tool.cfg)
-        s = Switcher(tool, lifecycle=lifecycle)
+            lifecycle = SwitchLifecycle(tool.cfg, out=out)
+        s = Switcher(tool, lifecycle=lifecycle, out=out)
         if args.rename:
             if len(args.rename) > 2:
                 parser.error("--rename takes [OLD] NEW")
